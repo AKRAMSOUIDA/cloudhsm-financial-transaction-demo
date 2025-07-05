@@ -1,0 +1,282 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Financial Transaction Processing Application Stack'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'cloudhsm-financial-demo'
+  
+  InfrastructureStackName:
+    Type: String
+    Default: 'cloudhsm-financial-demo'
+    Description: 'Name of the infrastructure stack'
+
+Resources:
+  # ============================================================================
+  # ECS Cluster
+  # ============================================================================
+  
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-cluster'
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 4
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  # ============================================================================
+  # Task Definition for Financial Processing Service
+  # ============================================================================
+  
+  FinancialProcessingTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-financial-processing'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 1024
+      Memory: 2048
+      ExecutionRoleArn: 
+        Fn::ImportValue: !Sub '${InfrastructureStackName}-app-role-arn'
+      TaskRoleArn:
+        Fn::ImportValue: !Sub '${InfrastructureStackName}-app-role-arn'
+      ContainerDefinitions:
+        - Name: financial-processor
+          Image: 'public.ecr.aws/docker/library/python:3.9-slim'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          Environment:
+            - Name: CLOUDHSM_CLUSTER_ID
+              Value: 
+                Fn::ImportValue: !Sub '${InfrastructureStackName}-hsm-cluster-id'
+            - Name: DATABASE_ENDPOINT
+              Value:
+                Fn::ImportValue: !Sub '${InfrastructureStackName}-db-endpoint'
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub '/aws/ecs/${ProjectName}'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: financial-processor
+          Command:
+            - /bin/sh
+            - -c
+            - |
+              pip install boto3 flask psycopg2-binary && 
+              python -c "
+              from flask import Flask, request, jsonify
+              import boto3
+              import json
+              import time
+              import hashlib
+              
+              app = Flask(__name__)
+              
+              @app.route('/health')
+              def health():
+                  return {'status': 'healthy', 'timestamp': time.time()}
+              
+              @app.route('/process-transaction', methods=['POST'])
+              def process_transaction():
+                  data = request.json
+                  # Simulate HSM operations
+                  transaction_id = hashlib.sha256(str(time.time()).encode()).hexdigest()[:16]
+                  return {
+                      'transaction_id': transaction_id,
+                      'status': 'APPROVED',
+                      'auth_code': 'AUTH' + transaction_id[:6].upper(),
+                      'hsm_operations': [
+                          {'operation': 'encrypt_pan', 'status': 'success'},
+                          {'operation': 'verify_pin', 'status': 'success'},
+                          {'operation': 'sign_transaction', 'status': 'success'}
+                      ]
+                  }
+              
+              if __name__ == '__main__':
+                  app.run(host='0.0.0.0', port=8080)
+              "
+
+  # ============================================================================
+  # ECS Service
+  # ============================================================================
+  
+  FinancialProcessingService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub '${ProjectName}-financial-service'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref FinancialProcessingTaskDefinition
+      DesiredCount: 2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - Fn::ImportValue: !Sub '${InfrastructureStackName}-app-sg-id'
+          Subnets:
+            - Fn::ImportValue: !Sub '${InfrastructureStackName}-private-subnet-1'
+            - Fn::ImportValue: !Sub '${InfrastructureStackName}-private-subnet-2'
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - ContainerName: financial-processor
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroup
+      HealthCheckGracePeriodSeconds: 60
+
+  # ============================================================================
+  # Load Balancer Target Group
+  # ============================================================================
+  
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-tg'
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      VpcId:
+        Fn::ImportValue: !Sub '${InfrastructureStackName}-vpc-id'
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  # Load Balancer Listener
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn:
+        Fn::ImportValue: !Sub '${InfrastructureStackName}-alb-dns'
+      Port: 80
+      Protocol: HTTP
+
+  # ============================================================================
+  # Lambda Functions for HSM Operations
+  # ============================================================================
+  
+  HSMKeyManagementFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-hsm-key-management'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role:
+        Fn::ImportValue: !Sub '${InfrastructureStackName}-app-role-arn'
+      Timeout: 300
+      Environment:
+        Variables:
+          CLOUDHSM_CLUSTER_ID:
+            Fn::ImportValue: !Sub '${InfrastructureStackName}-hsm-cluster-id'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              HSM Key Management Operations
+              """
+              try:
+                  operation = event.get('operation', 'status')
+                  cluster_id = os.environ['CLOUDHSM_CLUSTER_ID']
+                  
+                  if operation == 'status':
+                      return get_hsm_status(cluster_id)
+                  elif operation == 'rotate_keys':
+                      return rotate_master_keys(cluster_id)
+                  elif operation == 'backup_keys':
+                      return backup_keys(cluster_id)
+                  else:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Invalid operation'})
+                      }
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def get_hsm_status(cluster_id):
+              """Get CloudHSM cluster status"""
+              client = boto3.client('cloudhsmv2')
+              response = client.describe_clusters(
+                  Filters={'clusterIds': [cluster_id]}
+              )
+              
+              cluster = response['Clusters'][0]
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'cluster_id': cluster_id,
+                      'state': cluster['State'],
+                      'hsm_count': len(cluster.get('Hsms', [])),
+                      'security_group': cluster.get('SecurityGroup'),
+                      'vpc_id': cluster.get('VpcId')
+                  })
+              }
+          
+          def rotate_master_keys(cluster_id):
+              """Simulate key rotation process"""
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'operation': 'rotate_keys',
+                      'status': 'initiated',
+                      'cluster_id': cluster_id,
+                      'message': 'Key rotation process started'
+                  })
+              }
+          
+          def backup_keys(cluster_id):
+              """Simulate key backup process"""
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'operation': 'backup_keys',
+                      'status': 'completed',
+                      'cluster_id': cluster_id,
+                      'backup_id': f'backup-{int(time.time())}'
+                  })
+              }
+
+Outputs:
+  ECSClusterName:
+    Description: 'ECS Cluster Name'
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${ProjectName}-ecs-cluster'
+
+  ServiceName:
+    Description: 'ECS Service Name'
+    Value: !Ref FinancialProcessingService
+    Export:
+      Name: !Sub '${ProjectName}-service-name'
+
+  HSMKeyManagementFunctionArn:
+    Description: 'HSM Key Management Lambda Function ARN'
+    Value: !GetAtt HSMKeyManagementFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-hsm-lambda-arn'

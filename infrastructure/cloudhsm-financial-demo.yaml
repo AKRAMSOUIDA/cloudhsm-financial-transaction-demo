@@ -1,0 +1,474 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudHSM Financial Transaction Processing Demo Infrastructure'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'cloudhsm-financial-demo'
+    Description: 'Name prefix for all resources'
+  
+  HSMInstanceType:
+    Type: String
+    Default: 'hsm1.medium'
+    AllowedValues: ['hsm1.medium']
+    Description: 'CloudHSM instance type'
+  
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: 'Password for RDS database'
+
+Resources:
+  # ============================================================================
+  # VPC and Networking Infrastructure
+  # ============================================================================
+  
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: '10.0.0.0/16'
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+        - Key: Purpose
+          Value: 'CloudHSM Financial Demo'
+
+  # Internet Gateway for public subnet
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Private Subnets for CloudHSM (Multi-AZ for HA)
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: '10.0.1.0/24'
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-subnet-1'
+        - Key: Purpose
+          Value: 'CloudHSM Primary'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: '10.0.2.0/24'
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-subnet-2'
+        - Key: Purpose
+          Value: 'CloudHSM Secondary'
+
+  # Public Subnet for NAT Gateway
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: '10.0.3.0/24'
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet'
+
+  # NAT Gateway for private subnet internet access
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nat-gateway'
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-rt'
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NATGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ============================================================================
+  # Security Groups
+  # ============================================================================
+
+  # CloudHSM Security Group
+  CloudHSMSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for CloudHSM cluster'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2223
+          ToPort: 2225
+          SourceSecurityGroupId: !Ref ApplicationSecurityGroup
+          Description: 'CloudHSM client communication'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cloudhsm-sg'
+
+  # Application Security Group
+  ApplicationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for application tier'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: 'HTTP from ALB'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: 'HTTPS from ALB'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-app-sg'
+
+  # ALB Security Group
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for Application Load Balancer'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '0.0.0.0/0'
+          Description: 'HTTP from internet'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: 'HTTPS from internet'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb-sg'
+
+  # Database Security Group
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for RDS database'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ApplicationSecurityGroup
+          Description: 'PostgreSQL from application'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-sg'
+
+  # ============================================================================
+  # CloudHSM Cluster
+  # ============================================================================
+
+  CloudHSMCluster:
+    Type: AWS::CloudHSMV2::Cluster
+    Properties:
+      HsmType: !Ref HSMInstanceType
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-hsm-cluster'
+        - Key: Purpose
+          Value: 'Financial Transaction Processing'
+
+  # Primary HSM Instance
+  CloudHSMInstance1:
+    Type: AWS::CloudHSMV2::Hsm
+    Properties:
+      ClusterId: !Ref CloudHSMCluster
+      AvailabilityZone: !Select [0, !GetAZs '']
+      SubnetId: !Ref PrivateSubnet1
+
+  # Secondary HSM Instance for HA
+  CloudHSMInstance2:
+    Type: AWS::CloudHSMV2::Hsm
+    Properties:
+      ClusterId: !Ref CloudHSMCluster
+      AvailabilityZone: !Select [1, !GetAZs '']
+      SubnetId: !Ref PrivateSubnet2
+
+  # ============================================================================
+  # IAM Roles and Policies
+  # ============================================================================
+
+  # CloudHSM Service Role
+  CloudHSMServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-cloudhsm-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudhsm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/CloudHSMServiceRolePolicy
+
+  # Application Execution Role
+  ApplicationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-app-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - ecs-tasks.amazonaws.com
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # CloudHSM Client Policy
+  CloudHSMClientPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-cloudhsm-client-policy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - cloudhsm:DescribeClusters
+              - cloudhsm:DescribeBackups
+              - cloudhsm:ListTags
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Roles:
+        - !Ref ApplicationExecutionRole
+
+  # ============================================================================
+  # Database Infrastructure
+  # ============================================================================
+
+  # DB Subnet Group
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: 'Subnet group for financial demo database'
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-subnet-group'
+
+  # RDS Instance with encryption
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-database'
+      DBInstanceClass: 'db.t3.micro'
+      Engine: 'postgres'
+      EngineVersion: '13.7'
+      AllocatedStorage: 20
+      StorageType: 'gp2'
+      StorageEncrypted: true
+      MasterUsername: 'dbadmin'
+      MasterUserPassword: !Ref DatabasePassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      BackupRetentionPeriod: 7
+      MultiAZ: false
+      PubliclyAccessible: false
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-database'
+
+  # ============================================================================
+  # Application Load Balancer
+  # ============================================================================
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-alb'
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet
+        - !Ref PrivateSubnet1  # Need public subnet in second AZ for ALB
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb'
+
+  # ============================================================================
+  # CloudWatch Log Groups
+  # ============================================================================
+
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ecs/${ProjectName}'
+      RetentionInDays: 30
+
+  HSMOperationsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/cloudhsm/${ProjectName}'
+      RetentionInDays: 90
+
+  # ============================================================================
+  # Secrets Manager for HSM Credentials
+  # ============================================================================
+
+  HSMCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/hsm-credentials'
+      Description: 'CloudHSM cluster credentials and configuration'
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "admin"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+
+Outputs:
+  # Network Information
+  VPCId:
+    Description: 'VPC ID for the financial demo'
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${ProjectName}-vpc-id'
+
+  PrivateSubnet1Id:
+    Description: 'Private Subnet 1 ID'
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${ProjectName}-private-subnet-1'
+
+  PrivateSubnet2Id:
+    Description: 'Private Subnet 2 ID'
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${ProjectName}-private-subnet-2'
+
+  # CloudHSM Information
+  CloudHSMClusterId:
+    Description: 'CloudHSM Cluster ID'
+    Value: !Ref CloudHSMCluster
+    Export:
+      Name: !Sub '${ProjectName}-hsm-cluster-id'
+
+  CloudHSMClusterCertificate:
+    Description: 'CloudHSM Cluster Certificate'
+    Value: !GetAtt CloudHSMCluster.ClusterCertificate
+
+  # Security Groups
+  ApplicationSecurityGroupId:
+    Description: 'Application Security Group ID'
+    Value: !Ref ApplicationSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-app-sg-id'
+
+  # Database Information
+  DatabaseEndpoint:
+    Description: 'RDS Database Endpoint'
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${ProjectName}-db-endpoint'
+
+  # Load Balancer
+  LoadBalancerDNS:
+    Description: 'Application Load Balancer DNS Name'
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${ProjectName}-alb-dns'
+
+  # IAM Roles
+  ApplicationExecutionRoleArn:
+    Description: 'Application Execution Role ARN'
+    Value: !GetAtt ApplicationExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-app-role-arn'

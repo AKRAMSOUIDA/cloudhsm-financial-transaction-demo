@@ -1,0 +1,135 @@
+{
+  "valid_transactions": [
+    {
+      "description": "Standard purchase transaction",
+      "request": {
+        "card_number": "4111111111111111",
+        "pin": "1234",
+        "amount": 99.99,
+        "merchant_id": "MERCHANT_001"
+      },
+      "expected_response": {
+        "status": "APPROVED",
+        "fraud_score": "< 75"
+      }
+    },
+    {
+      "description": "Small amount transaction",
+      "request": {
+        "card_number": "4111111111111111",
+        "pin": "1234",
+        "amount": 5.00,
+        "merchant_id": "COFFEE_SHOP_123"
+      },
+      "expected_response": {
+        "status": "APPROVED",
+        "fraud_score": "< 25"
+      }
+    },
+    {
+      "description": "Medium amount transaction",
+      "request": {
+        "card_number": "4111111111111111",
+        "pin": "1234",
+        "amount": 500.00,
+        "merchant_id": "ELECTRONICS_STORE"
+      },
+      "expected_response": {
+        "status": "APPROVED",
+        "fraud_score": "< 50"
+      }
+    }
+  ],
+  "declined_transactions": [
+    {
+      "description": "Invalid PIN transaction",
+      "request": {
+        "card_number": "4111111111111111",
+        "pin": "0000",
+        "amount": 100.00,
+        "merchant_id": "MERCHANT_002"
+      },
+      "expected_response": {
+        "status": "DECLINED",
+        "reason": "Invalid PIN"
+      }
+    },
+    {
+      "description": "High amount fraud detection",
+      "request": {
+        "card_number": "4111111111111111",
+        "pin": "1234",
+        "amount": 10000.00,
+        "merchant_id": "HIGH_RISK_MERCHANT"
+      },
+      "expected_response": {
+        "status": "DECLINED",
+        "reason": "Fraud detected",
+        "fraud_score": ">= 75"
+      }
+    },
+    {
+      "description": "Suspicious merchant transaction",
+      "request": {
+        "card_number": "4111111111111111",
+        "pin": "1234",
+        "amount": 200.00,
+        "merchant_id": "SUSPICIOUS_MERCHANT_999"
+      },
+      "expected_response": {
+        "status": "DECLINED",
+        "reason": "Fraud detected"
+      }
+    }
+  ],
+  "load_test_transactions": [
+    {
+      "description": "Batch of transactions for load testing",
+      "count": 100,
+      "template": {
+        "card_number": "4111111111111111",
+        "pin": "1234",
+        "amount": "random(1, 1000)",
+        "merchant_id": "LOAD_TEST_MERCHANT_{index}"
+      }
+    }
+  ],
+  "edge_cases": [
+    {
+      "description": "Zero amount transaction",
+      "request": {
+        "card_number": "4111111111111111",
+        "pin": "1234",
+        "amount": 0.00,
+        "merchant_id": "MERCHANT_ZERO"
+      },
+      "expected_response": {
+        "status": "APPROVED"
+      }
+    },
+    {
+      "description": "Maximum amount transaction",
+      "request": {
+        "card_number": "4111111111111111",
+        "pin": "1234",
+        "amount": 99999.99,
+        "merchant_id": "LUXURY_MERCHANT"
+      },
+      "expected_response": {
+        "status": "DECLINED",
+        "reason": "Fraud detected"
+      }
+    },
+    {
+      "description": "Missing merchant ID",
+      "request": {
+        "card_number": "4111111111111111",
+        "pin": "1234",
+        "amount": 50.00
+      },
+      "expected_response": {
+        "status": "APPROVED"
+      }
+    }
+  ]
+}
